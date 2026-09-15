@@ -87,7 +87,17 @@ def cmd_check(args) -> int:
         attempts.append(floor.attempts)
         for room_type in floor.counts():
             presence[room_type] += 1
+    from . import tilemap as tilemap_mod
+
+    sample = min(args.count, 300)
+    forced = [
+        tilemap_mod.rooms_to_boss(f, tilemap_mod.build(f)) + 1
+        for f in (generate(s, cfg) for s in range(sample))
+    ]
     print(f"проверено этажей: {args.count}, с нарушениями: {failures}")
+    print(f"комнат обязательно пройти до босса: "
+          f"min {min(forced)}, среднее {sum(forced)/len(forced):.2f}, max {max(forced)} "
+          f"(ГДД: 5–6, выборка {sample})")
     print(f"комнат на этаже: min {min(totals)}, среднее {sum(totals)/len(totals):.2f}, "
           f"max {max(totals)}")
     print(f"попыток генерации на этаж: среднее {sum(attempts)/len(attempts):.3f}, "

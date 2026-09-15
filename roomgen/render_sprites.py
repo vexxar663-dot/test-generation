@@ -42,30 +42,39 @@ def _font(size: int):
 # Наполнение комнаты предметами
 # ---------------------------------------------------------------------------
 
-#: Что стоит в комнате: (ключ спрайта, к стене ли, сколько штук).
-ROOM_PROPS: Dict[RoomType, Sequence[Tuple[str, bool, int]]] = {
-    RoomType.SPAWN:     (("locker", True, 2),),
-    RoomType.NORMAL:    (("desk", True, 1),),
-    RoomType.HARD:      (("desk", True, 1),),
-    RoomType.CAFETERIA: (("fridge", True, 1), ("stove", True, 1),
-                         ("counter", True, 1), ("coin", False, 3)),
-    RoomType.TOILET:    (("toilet", True, 2), ("sink", True, 1)),
-    RoomType.CHEST:     (("chest_wood", False, 1), ("coin", False, 2)),
-    RoomType.EVENT:     (("board", True, 1), ("desk", False, 2)),
-    RoomType.STAIRS:    (("door", True, 1), ("star", False, 3)),
+#: Что стоит в комнате: (спрайт, режим раскладки, сколько).
+#: "wall" — вдоль верхней стены, "rows" — рядами, как парты, "free" — врассыпную.
+ROOM_PROPS: Dict[RoomType, Sequence[Tuple[str, str, int]]] = {
+    RoomType.SPAWN:     (("locker", "wall", 6),),
+    RoomType.NORMAL:    (("board", "wall", 1), ("desk", "rows", 9)),
+    RoomType.HARD:      (("board", "wall", 1), ("desk", "rows", 6)),
+    RoomType.CAFETERIA: (("fridge", "wall", 1), ("stove", "wall", 1),
+                         ("counter", "wall", 2), ("desk", "rows", 6),
+                         ("coin", "free", 4)),
+    RoomType.TOILET:    (("toilet", "wall", 3), ("sink", "wall", 1)),
+    RoomType.CHEST:     (("chest_wood", "free", 1), ("coin", "free", 3)),
+    RoomType.EVENT:     (("board", "wall", 1), ("bookshelf", "wall", 2),
+                         ("desk", "rows", 6)),
+    RoomType.STAIRS:    (("door", "wall", 1), ("star", "free", 3)),
     RoomType.BOSS:      (),
 }
 
 
-def _enemy_count(room_type: RoomType, floor_number: int) -> int:
-    """ГДД: с каждым этажом растёт число врагов."""
+def _enemy_count(room_type: RoomType, floor_number: int, interior: int) -> int:
+    """ГДД 4.4: с каждым этажом растёт число врагов; масштабируем по площади.
+
+    Опорная точка — класс 20×15 тайлов (примерно 300 тайлов пола).
+    """
+    scale = max(interior / 300.0, 0.35)
     if room_type is RoomType.NORMAL:
-        return 2 + floor_number // 2
-    if room_type is RoomType.HARD:
-        return 4 + floor_number // 2   # «врагов на 20–30% больше» + элита
-    if room_type is RoomType.BOSS:
-        return 2
-    return 0
+        base = 4 + floor_number
+    elif room_type is RoomType.HARD:
+        base = 6 + floor_number          # «врагов на 20–30% больше» + элита
+    elif room_type is RoomType.BOSS:
+        base = 3
+    else:
+        return 0
+    return max(1, round(base * scale))
 
 
 def _paste(canvas: Image.Image, sprite: Image.Image, tile_xy: Tuple[int, int]) -> None:
@@ -105,6 +114,23 @@ class _Placer:
         """Занять место под спрайт, поставленный в заранее известную точку."""
         for c in self._footprint(spot[0], spot[1], sprite, margin):
             self.free.discard(c)
+
+    def place_at(self, sprite: Image.Image, spot, margin: int = 0) -> bool:
+        """Поставить в конкретный тайл, если он свободен."""
+        if any(c not in self.free for c in self._footprint(spot[0], spot[1], sprite)):
+            return False
+        self.reserve(sprite, spot, margin)
+        return True
+
+    def lattice(self, sprite: Image.Image, step_x: int, step_y: int):
+        """Точки опоры ровными рядами — парты в классе, а не россыпью."""
+        if not self.free:
+            return []
+        xs = sorted({x for x, _ in self.free})
+        ys = sorted({y for _, y in self.free})
+        cols = xs[1::step_x]
+        rows = ys[2::step_y]
+        return [(x, y) for y in rows for x in cols]
 
     def place(self, sprite: Image.Image, at_wall: bool = False, margin: int = 0):
         """Занять место под спрайт. Возвращает тайл опоры или None.
@@ -146,8 +172,8 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
             if kind is T.Tile.WALL:
                 sprite = atlas.wall_tile(brick)
             else:
-                # Проём и коридор всегда школьной плиткой — читается как проход.
-                if kind is T.Tile.DOORWAY:
+                # Коридор и проёмы всегда школьной плиткой — проход читается как проход.
+                if kind in (T.Tile.HALL, T.Tile.DOORWAY):
                     family = T.CORRIDOR_THEME[0]
                 variant = (tx * 31 + ty * 17 + floor.seed) % 4
                 sprite = atlas.floor_tile(family, variant)
@@ -167,9 +193,20 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
                 _paste(canvas, sprite, spot)
             return spot
 
-        for key, at_wall, count in ROOM_PROPS.get(room_type, ()):
-            for _ in range(count):
-                put(atlas.prop(key), at_wall)
+        for key, mode, count in ROOM_PROPS.get(room_type, ()):
+            sprite = atlas.prop(key)
+            if mode == "rows":
+                spots = placer.lattice(sprite, step_x=4, step_y=3)
+                placed = 0
+                for spot in spots:
+                    if placed >= count:
+                        break
+                    if placer.place_at(sprite, spot):
+                        _paste(canvas, sprite, spot)
+                        placed += 1
+            else:
+                for _ in range(count):
+                    put(sprite, at_wall=(mode == "wall"))
 
         # Второй сундук в комнате — золотой, чтобы читалась разная награда.
         if room_type is RoomType.CHEST and rng.random() < 0.5:
@@ -178,7 +215,7 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
         if room_type is RoomType.SPAWN:
             put(atlas.hero(), spot=tm.room_center(cell), margin=1)
 
-        n = _enemy_count(room_type, floor_number)
+        n = _enemy_count(room_type, floor_number, len(tm.interior(cell)))
         if room_type is RoomType.BOSS:
             put(atlas.enemy("boss"), spot=tm.room_center(cell), margin=1)
         if room_type is RoomType.HARD:
@@ -205,7 +242,7 @@ def render_room(floor: Floor, cell, path: str, scale: int = 6,
     """Одна комната крупно — видно, как читается тайлсет вблизи."""
     canvas, tm = draw_map(floor, atlas, floor_number)
     x, y, w, h = tm.room_rects[cell]
-    pad = T.GAP
+    pad = T.HALL
     box = ((x - pad) * TILE_SIZE, (y - pad) * TILE_SIZE,
            (x + w + pad) * TILE_SIZE, (y + h + pad) * TILE_SIZE)
     box = (max(box[0], 0), max(box[1], 0),
@@ -254,10 +291,11 @@ def render_annotated(floor: Floor, path: str, scale: int = 2,
     counts = floor.counts()
     d.text((pad, 14), f"Equation Dodge — этаж {floor_number}, seed {floor.seed}",
            font=f_title, fill=INK)
+    forced = T.rooms_to_boss(floor, tm) + 1
     d.text((pad, 44),
-           f"{len(floor.rooms())} комнат · {len(floor.doors)} дверей · "
-           f"путь до босса {len(floor.critical_path())} комнат · "
-           f"сетка {tm.width}×{tm.height} тайлов по {TILE_SIZE} px",
+           f"{len(floor.rooms())} комнат · до босса обязательно пройти {forced} "
+           f"(ГДД: 5–6) · сетка {tm.width}×{tm.height} тайлов по {TILE_SIZE} px, "
+           f"кабинет {T.ROOM_W}×{T.ROOM_H} ≈ {T.ROOM_W*0.41:.0f}×{T.ROOM_H*0.41:.0f} м",
            font=f_small, fill=INK_MUTED)
 
     # Подписи комнат — поверх верхней стены блока.

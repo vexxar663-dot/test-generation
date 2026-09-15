@@ -49,14 +49,20 @@ def render_summary(floor: Floor) -> str:
         RoomType.BOSS, RoomType.STAIRS,
     ]
     parts = [f"{RU_NAME[t]}: {counts.get(t, 0)}" for t in order if counts.get(t, 0)]
+    from . import tilemap
+
+    tm = tilemap.build(floor)
+    forced = tilemap.rooms_to_boss(floor, tm) + 1
     crit = floor.critical_path()
     lo_all, hi_all = floor.time_estimate()
-    lo_crit, hi_crit = floor.time_estimate(crit)
+    # Спидран считаем по комнатам, которые школьная планировка пройти заставляет:
+    # мимо остальных игрок проходит коридором.
+    lo_crit, hi_crit = floor.time_estimate(crit[:forced])
     return (
         f"seed={floor.seed}  попыток={floor.attempts}  комнат={len(floor.rooms())}  "
         f"дверей={len(floor.doors)}\n"
-        f"основной путь: {len(floor.main_path)} клеток, "
-        f"кратчайший до босса: {len(crit)} комнат\n"
+        f"обязательно пройти до босса: {forced} комнат (ГДД: 5–6), "
+        f"сетка школы {tm.width}×{tm.height} тайлов\n"
         + ", ".join(parts)
         + f"\nвремя: спидран {lo_crit/60:.1f}–{hi_crit/60:.1f} мин, "
         f"на 100% {lo_all/60:.1f}–{hi_all/60:.1f} мин (ГДД: 5–7 мин)"

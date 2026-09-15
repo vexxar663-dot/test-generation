@@ -215,7 +215,9 @@ def _style_axes(ax, title, xlabel):
 def figure_stats(n: int, path: str, cfg=None) -> str:
     """Распределения по n этажам с наложенными требованиями ГДД."""
     totals, path_len, times, crit_len = [], [], [], []
-    t_lo, t_hi = [], []
+    t_lo, t_hi, forced = [], [], []
+    #: Тайловая метрика считается дольше — берём подвыборку.
+    forced_sample = min(n, 400)
     type_counts: Counter = Counter()
     presence: Counter = Counter()
     attempts = []
@@ -224,6 +226,10 @@ def figure_stats(n: int, path: str, cfg=None) -> str:
         totals.append(len(floor.rooms()))
         path_len.append(len(floor.main_path))
         crit_len.append(len(floor.critical_path()))
+        if seed < forced_sample:
+            from . import tilemap as _T
+
+            forced.append(_T.rooms_to_boss(floor, _T.build(floor)) + 1)
         attempts.append(floor.attempts)
         lo, hi = floor.time_estimate()
         t_lo.append(lo / 60)
@@ -253,15 +259,17 @@ def figure_stats(n: int, path: str, cfg=None) -> str:
     ax.text(mean_total, top * 0.72, f" факт {mean_total:.1f}",
             color=P.TEXT_SECONDARY, fontsize=9.5)
 
-    # 2. Длина пути.
+    # 2. Сколько комнат игрок обязан пройти (по тайлам школьной планировки).
     ax = axes[0, 1]
-    vals = sorted(Counter(crit_len).items())
-    ax.bar([v for v, _ in vals], [c / n * 100 for _, c in vals],
+    sample = len(forced)
+    vals = sorted(Counter(forced).items())
+    ax.bar([v for v, _ in vals], [c / sample * 100 for _, c in vals],
            color=P.CHART_HUE, width=0.72, zorder=3)
     ax.set_ylabel("% этажей", fontsize=10)
-    _style_axes(ax, "Комнат на пути спавн → босс",
-                "минимум геометрии сетки 5×5 — 9 комнат")
-    ax.axvline(8.5, color=P.TEXT_MUTED, lw=1.4, ls=":", zorder=4)
+    ax.set_ylim(0, max(c / sample * 100 for _, c in vals) * 1.25)
+    _style_axes(ax, "Комнат обязательно пройти до босса",
+                f"мимо остальных можно пройти коридором · выборка {sample} этажей")
+    _band(ax, 4.5, 6.5, "ГДД 3.1: 5–6 комнат")
 
     # 3. Состав этажа.
     ax = axes[1, 0]
