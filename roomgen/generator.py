@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import (
+    METERS_PER_TILE,
+    PLAYER_SPEED_MPS,
     PROTECTED_TYPES,
     ROOM_SECONDS,
     TERMINAL_TYPES,
@@ -191,15 +193,29 @@ class Floor:
         return list(reversed(path))
 
     # --- тайминг (ГДД «Тайминг прохождения этажа») ------------------------
+    def travel_seconds(self, ids: Optional[Sequence[RoomId]] = None) -> float:
+        """Сколько секунд уходит на саму беготню по комнатам такого размера.
+
+        При больших залах дорога перестаёт быть пренебрежимой: комната 39×28 м
+        пересекается за 8 секунд, а бой в ней по ГДД длится 5–15.
+        """
+        ids = list(self.rooms()) if ids is None else list(ids)
+        metres = sum(
+            (self.room(rid).w + self.room(rid).h) / 2 * METERS_PER_TILE for rid in ids
+        )
+        return metres / PLAYER_SPEED_MPS
+
     def time_estimate(self, ids: Optional[Sequence[RoomId]] = None) -> Tuple[float, float]:
+        """(мин, макс) секунд: бой и взаимодействие по ГДД плюс дорога."""
         ids = list(self.rooms()) if ids is None else list(ids)
         lo = hi = 0.0
         for rid in ids:
             a, b = ROOM_SECONDS[self.type_at(rid)]
             lo += a
             hi += b
-        moves = max(len(ids) - 1, 0)
-        return lo + moves * TRANSITION_SECONDS, hi + moves * TRANSITION_SECONDS
+        doors = max(len(ids) - 1, 0) * TRANSITION_SECONDS
+        travel = self.travel_seconds(ids)
+        return lo + doors + travel, hi + doors + travel
 
 
 # ---------------------------------------------------------------------------

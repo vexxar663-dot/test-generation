@@ -43,29 +43,47 @@ def _font(size: int):
 # ---------------------------------------------------------------------------
 
 #: Что стоит в комнате: (спрайт, режим раскладки, сколько).
-#: "wall" — вдоль верхней стены, "rows" — рядами, как парты, "free" — врассыпную.
+#:   "wall"     — вдоль верхней стены, число фиксировано (доска, плита);
+#:   "wall_row" — вдоль верхней стены, число растёт с площадью (шкафчики, кабинки);
+#:   "rows"     — рядами по всей комнате, число растёт с площадью (парты, столы);
+#:   "free"     — врассыпную, число фиксировано (сундук, монеты, стойки с перками).
 ROOM_PROPS: Dict[RoomType, Sequence[Tuple[str, str, int]]] = {
-    RoomType.SPAWN:     (("locker", "wall", 6),),
+    RoomType.SPAWN:     (("locker", "wall_row", 6),),
     RoomType.NORMAL:    (("board", "wall", 1), ("desk", "rows", 9)),
     RoomType.HARD:      (("board", "wall", 1), ("desk", "rows", 6)),
     RoomType.CAFETERIA: (("fridge", "wall", 1), ("stove", "wall", 1),
-                         ("counter", "wall", 2), ("desk", "rows", 6),
+                         ("counter", "wall_row", 2), ("desk", "rows", 6),
                          ("coin", "free", 4)),
-    RoomType.TOILET:    (("toilet", "wall", 3), ("sink", "wall", 1)),
+    RoomType.TOILET:    (("toilet", "wall_row", 3), ("sink", "wall_row", 1)),
     RoomType.CHEST:     (("chest_wood", "free", 1), ("coin", "free", 3)),
-    RoomType.EVENT:     (("board", "wall", 1), ("bookshelf", "wall", 2),
+    RoomType.EVENT:     (("board", "wall", 1), ("bookshelf", "wall_row", 2),
                          ("desk", "rows", 6)),
     RoomType.STAIRS:    (("door", "wall", 1), ("star", "free", 3)),
     RoomType.BOSS:      (),
 }
 
+#: Площадь пола обычного класса в тайлах — опора для числа врагов. Бой в
+#: комнате по ГДД длится 5–15 секунд, поэтому враги считаются от комнаты,
+#: а не от квадратных метров.
+REFERENCE_INTERIOR = 5000
+
+#: А мебель заполняет площадь, поэтому её плотность привязана к метрам:
+#: столько тайлов пола приходилось на один предмет в комнате прежнего размера.
+PROP_REFERENCE_INTERIOR = 300
+
+
+def _area_scale(interior: int, power: float = 0.5,
+                reference: int = REFERENCE_INTERIOR) -> float:
+    """Во сколько раз комната крупнее опорной (с затуханием по умолчанию)."""
+    return max(interior / reference, 0.05) ** power
+
 
 def _enemy_count(room_type: RoomType, floor_number: int, interior: int) -> int:
-    """ГДД 4.4: с каждым этажом растёт число врагов; масштабируем по площади.
+    """ГДД 4.4: с каждым этажом растёт число врагов.
 
-    Опорная точка — класс 20×15 тайлов (примерно 300 тайлов пола).
+    По площади масштабируем с корнем: бой в обычной комнате по ГДД длится
+    5–15 секунд, и линейный рост от площади сделал бы это время недостижимым.
     """
-    scale = max(interior / 300.0, 0.35)
     if room_type is RoomType.NORMAL:
         base = 4 + floor_number
     elif room_type is RoomType.HARD:
@@ -74,14 +92,17 @@ def _enemy_count(room_type: RoomType, floor_number: int, interior: int) -> int:
         base = 3
     else:
         return 0
-    return max(1, round(base * scale))
+    return max(1, round(base * _area_scale(interior)))
 
 
-def _paste(canvas: Image.Image, sprite: Image.Image, tile_xy: Tuple[int, int]) -> None:
+def _paste(canvas: Image.Image, sprite: Image.Image, tile_xy: Tuple[int, int],
+           tile_px: int = TILE_SIZE, origin: Tuple[int, int] = (0, 0)) -> None:
     """Поставить спрайт на тайл: по центру по горизонтали, «ногами» на нижний край."""
-    tx, ty = tile_xy
-    x = tx * TILE_SIZE + (TILE_SIZE - sprite.width) // 2
-    y = ty * TILE_SIZE + TILE_SIZE - sprite.height
+    tx, ty = tile_xy[0] - origin[0], tile_xy[1] - origin[1]
+    x = tx * tile_px + (tile_px - sprite.width) // 2
+    y = ty * tile_px + tile_px - sprite.height
+    if x + sprite.width <= 0 or y + sprite.height <= 0:
+        return
     canvas.alpha_composite(sprite, (max(x, 0), max(y, 0)))
 
 
@@ -153,17 +174,37 @@ class _Placer:
 # Основной рендер
 # ---------------------------------------------------------------------------
 
-def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
-             floor_number: int = 1) -> Tuple[Image.Image, T.TileMap]:
-    """Нарисовать этаж в масштабе 1:1. Возвращает картинку и сетку тайлов."""
+def draw_map(floor: Floor, atlas: Optional[Atlas] = None, floor_number: int = 1,
+             tile_px: int = TILE_SIZE,
+             region: Optional[Tuple[int, int, int, int]] = None,
+             ) -> Tuple[Image.Image, T.TileMap]:
+    """Нарисовать этаж. tile_px < 16 даёт уменьшенный обзор целого этажа.
+
+    После увеличения комнат карта в масштабе 1:1 — это около 110 мегапикселей,
+    поэтому обзорную картинку рисуем сразу мелким тайлом, а не уменьшаем готовую.
+    """
     atlas = atlas or Atlas()
     tm = T.build(floor)
-    canvas = Image.new("RGBA", (tm.width * TILE_SIZE, tm.height * TILE_SIZE), BACKDROP)
+    x0, y0, x1, y1 = region or (0, 0, tm.width, tm.height)
+    canvas = Image.new("RGBA", ((x1 - x0) * tile_px, (y1 - y0) * tile_px), BACKDROP)
     rng = random.Random(floor.seed * 7919 + floor_number)
+    ratio = tile_px / TILE_SIZE
+    cache: Dict[int, Image.Image] = {}
+
+    def scaled(sprite: Image.Image) -> Image.Image:
+        if tile_px == TILE_SIZE:
+            return sprite
+        key = id(sprite)
+        if key not in cache:
+            cache[key] = sprite.resize(
+                (max(1, round(sprite.width * ratio)), max(1, round(sprite.height * ratio))),
+                Image.NEAREST,
+            )
+        return cache[key]
 
     # 1. Пол и стены.
-    for ty in range(tm.height):
-        for tx in range(tm.width):
+    for ty in range(y0, y1):
+        for tx in range(x0, x1):
             kind = tm.tiles[ty][tx]
             if kind is T.Tile.EMPTY:
                 continue
@@ -177,12 +218,18 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
                     family = T.CORRIDOR_THEME[0]
                 variant = (tx * 31 + ty * 17 + floor.seed) % 4
                 sprite = atlas.floor_tile(family, variant)
-            canvas.alpha_composite(sprite, (tx * TILE_SIZE, ty * TILE_SIZE))
+            canvas.alpha_composite(scaled(sprite),
+                                   ((tx - x0) * tile_px, (ty - y0) * tile_px))
 
     # 2. Предметы, герой и враги.
     for cell in floor.rooms():
         room_type = floor.type_at(cell)
+        rx, ry, rw, rh = tm.room_rects[cell]
+        if rx >= x1 or ry >= y1 or rx + rw <= x0 or ry + rh <= y0:
+            continue          # комната вне запрошенного куска карты
         placer = _Placer(tm, cell, rng)
+
+        interior = len(tm.interior(cell))
 
         def put(sprite, at_wall=False, spot=None, margin=0):
             if spot is None:
@@ -190,23 +237,31 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
             else:
                 placer.reserve(sprite, spot, margin)  # герой/босс — место под них
             if spot:
-                _paste(canvas, sprite, spot)
+                _paste(canvas, scaled(sprite), spot, tile_px, (x0, y0))
             return spot
 
         for key, mode, count in ROOM_PROPS.get(room_type, ()):
             sprite = atlas.prop(key)
             if mode == "rows":
+                # Мебель заполняет площадь, поэтому её число растёт линейно.
+                want = max(1, round(count * _area_scale(
+                    interior, power=1.0, reference=PROP_REFERENCE_INTERIOR)))
                 spots = placer.lattice(sprite, step_x=4, step_y=3)
+                if len(spots) > want:   # разредить, но оставить рядами
+                    spots = spots[::max(1, len(spots) // want)]
                 placed = 0
                 for spot in spots:
-                    if placed >= count:
+                    if placed >= want:
                         break
                     if placer.place_at(sprite, spot):
-                        _paste(canvas, sprite, spot)
+                        _paste(canvas, scaled(sprite), spot, tile_px, (x0, y0))
                         placed += 1
-            else:
-                for _ in range(count):
-                    put(sprite, at_wall=(mode == "wall"))
+                continue
+            if mode == "wall_row":
+                count = max(1, round(count * _area_scale(
+                    interior, reference=PROP_REFERENCE_INTERIOR)))
+            for _ in range(count):
+                put(sprite, at_wall=mode.startswith("wall"))
 
         # Второй сундук в комнате — золотой, чтобы читалась разная награда.
         if room_type is RoomType.CHEST and rng.random() < 0.5:
@@ -215,7 +270,7 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
         if room_type is RoomType.SPAWN:
             put(atlas.hero(), spot=tm.room_center(cell), margin=1)
 
-        n = _enemy_count(room_type, floor_number, len(tm.interior(cell)))
+        n = _enemy_count(room_type, floor_number, interior)
         if room_type is RoomType.BOSS:
             put(atlas.enemy("boss"), spot=tm.room_center(cell), margin=1)
         if room_type is RoomType.HARD:
@@ -228,28 +283,31 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
     return canvas, tm
 
 
-def render_floor(floor: Floor, path: str, scale: int = 2,
-                 floor_number: int = 1, atlas: Optional[Atlas] = None) -> str:
-    """Чистая карта уровня без подписей."""
-    canvas, _ = draw_map(floor, atlas, floor_number)
-    canvas.resize((canvas.width * scale, canvas.height * scale),
-                  Image.NEAREST).convert("RGB").save(path)
+def render_floor(floor: Floor, path: str, scale: int = 1, floor_number: int = 1,
+                 atlas: Optional[Atlas] = None, tile_px: int = 4) -> str:
+    """Чистая карта уровня без подписей (по умолчанию — обзорная, тайл 4 px)."""
+    canvas, _ = draw_map(floor, atlas, floor_number, tile_px)
+    if scale != 1:
+        canvas = canvas.resize((canvas.width * scale, canvas.height * scale), Image.NEAREST)
+    canvas.convert("RGB").save(path)
     return path
 
 
-def render_room(floor: Floor, cell, path: str, scale: int = 6,
-                floor_number: int = 1, atlas: Optional[Atlas] = None) -> str:
+def render_room(floor: Floor, cell, path: str, scale: int = 1,
+                floor_number: int = 1, atlas: Optional[Atlas] = None,
+                tile_px: int = TILE_SIZE) -> str:
     """Одна комната крупно — видно, как читается тайлсет вблизи."""
-    canvas, tm = draw_map(floor, atlas, floor_number)
+    tm = T.build(floor)
     x, y, w, h = tm.room_rects[cell]
     pad = 10
-    box = ((x - pad) * TILE_SIZE, (y - pad) * TILE_SIZE,
-           (x + w + pad) * TILE_SIZE, (y + h + pad) * TILE_SIZE)
-    box = (max(box[0], 0), max(box[1], 0),
-           min(box[2], canvas.width), min(box[3], canvas.height))
-    crop = canvas.crop(box)
-    crop.resize((crop.width * scale, crop.height * scale),
-                Image.NEAREST).convert("RGB").save(path)
+    region = (max(x - pad, 0), max(y - pad, 0),
+              min(x + w + pad, tm.width), min(y + h + pad, tm.height))
+    # Рисуем только нужный кусок: карта целиком в масштабе 1:1 — это больше
+    # ста мегапикселей, и держать её в памяти ради одной комнаты ни к чему.
+    crop, _ = draw_map(floor, atlas, floor_number, tile_px, region)
+    if scale != 1:
+        crop = crop.resize((crop.width * scale, crop.height * scale), Image.NEAREST)
+    crop.convert("RGB").save(path)
     return path
 
 
@@ -274,12 +332,13 @@ def _legend_sprite(atlas: Atlas, spec: str) -> Image.Image:
     return atlas.enemy(key) if kind == "enemy" else atlas.prop(key)
 
 
-def render_annotated(floor: Floor, path: str, scale: int = 2,
-                     floor_number: int = 1, atlas: Optional[Atlas] = None) -> str:
-    """Карта + подписи комнат + легенда со спрайтами."""
+def render_annotated(floor: Floor, path: str, scale: int = 1, floor_number: int = 1,
+                     atlas: Optional[Atlas] = None, tile_px: int = 4) -> str:
+    """Карта + подписи комнат + легенда со спрайтами (обзорная, тайл 4 px)."""
     atlas = atlas or Atlas()
-    canvas, tm = draw_map(floor, atlas, floor_number)
-    big = canvas.resize((canvas.width * scale, canvas.height * scale), Image.NEAREST)
+    canvas, tm = draw_map(floor, atlas, floor_number, tile_px)
+    big = canvas if scale == 1 else canvas.resize(
+        (canvas.width * scale, canvas.height * scale), Image.NEAREST)
 
     head, legend_h, pad = 96, 150, 24
     out = Image.new("RGBA", (big.width + pad * 2, big.height + head + legend_h + pad),
@@ -296,7 +355,8 @@ def render_annotated(floor: Floor, path: str, scale: int = 2,
     d.text((pad, 44),
            f"{len(floor.rooms())} комнат · до босса обязательно пройти {forced} "
            f"(ГДД: 5–6) · петель {loops} · {tm.width}×{tm.height} тайлов "
-           f"≈ {tm.width*METERS_PER_TILE:.0f}×{tm.height*METERS_PER_TILE:.0f} м",
+           f"≈ {tm.width*METERS_PER_TILE:.0f}×{tm.height*METERS_PER_TILE:.0f} м · "
+           f"обзор в {TILE_SIZE//tile_px}× уменьшении",
            font=f_small, fill=INK_MUTED)
 
     # Подписи комнат — поверх верхней стены блока.
@@ -304,8 +364,8 @@ def render_annotated(floor: Floor, path: str, scale: int = 2,
         room_type = floor.type_at(cell)
         x, y, w, _h = tm.room_rects[cell]
         label = RU_NAME[room_type]
-        cx = pad + (x + w / 2) * TILE_SIZE * scale
-        cy = head + y * TILE_SIZE * scale - 15
+        cx = pad + (x + w / 2) * tile_px * scale
+        cy = head + y * tile_px * scale - 15
         box = d.textbbox((cx, cy), label, font=f_small, anchor="mm")
         d.rectangle([box[0] - 5, box[1] - 3, box[2] + 5, box[3] + 3], fill=BACKDROP)
         d.text((cx, cy), label, font=f_small, fill=INK_MUTED, anchor="mm")

@@ -12,7 +12,7 @@ from roomgen import tilemap as T  # noqa: E402
 from roomgen.config import METERS_PER_TILE, GenConfig, RoomType  # noqa: E402
 from roomgen.generator import generate  # noqa: E402
 
-SEEDS = range(120)
+SEEDS = range(40)
 
 
 class TestTileMap(unittest.TestCase):

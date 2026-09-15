@@ -13,27 +13,31 @@ from .generator import Floor
 
 __all__ = ["render", "render_summary"]
 
-#: Сколько тайлов в одном символе по горизонтали и вертикали.
-SCALE_X = 4
-SCALE_Y = 8
+#: Во сколько символов вписываем карту по ширине. Масштаб считается от размера
+#: этажа: комнаты крупные, и фиксированный шаг давно бы не влез в терминал.
+TARGET_COLS = 96
+#: Символ вдвое выше своей ширины, поэтому по вертикали шаг вдвое крупнее.
+ASPECT = 2
 
 
 def render(floor: Floor, mark_route: bool = True) -> str:
     """Карта этажа символами. Комнаты — рамки с глифом, перемычки — точки."""
-    cols = floor.width // SCALE_X + 1
-    rows = floor.height // SCALE_Y + 1
+    scale_x = max(1, -(-floor.width // TARGET_COLS))
+    scale_y = scale_x * ASPECT
+    cols = floor.width // scale_x + 1
+    rows = floor.height // scale_y + 1
     canvas: List[List[str]] = [[" "] * cols for _ in range(rows)]
     route = set(floor.critical_path()) if mark_route else set()
 
     for corridor in floor.corridors.values():
         for ty in range(corridor.y, corridor.y2):
             for tx in range(corridor.x, corridor.x2):
-                canvas[ty // SCALE_Y][tx // SCALE_X] = "."
+                canvas[ty // scale_y][tx // scale_x] = "."
 
     for rid in floor.rooms():
         room = floor.room(rid)
-        x0, x1 = room.x // SCALE_X, (room.x2 - 1) // SCALE_X
-        y0, y1 = room.y // SCALE_Y, (room.y2 - 1) // SCALE_Y
+        x0, x1 = room.x // scale_x, (room.x2 - 1) // scale_x
+        y0, y1 = room.y // scale_y, (room.y2 - 1) // scale_y
         fill = "#" if rid in route else "+"
         for ty in range(y0, y1 + 1):
             for tx in range(x0, x1 + 1):
