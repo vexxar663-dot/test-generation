@@ -1,7 +1,7 @@
-"""Шаг 8 ГДД — проверка корректности этажа.
+"""Проверка корректности этажа: геометрия, связность и лимиты ГДД.
 
 validate() возвращает список нарушений. Пустой список = этаж валиден.
-Генератор вызывает её на каждой попытке: этаж с нарушениями не отдаётся наружу.
+Генератор вызывает её на каждой попытке: этаж с нарушениями наружу не уходит.
 """
 
 from __future__ import annotations
@@ -9,15 +9,14 @@ from __future__ import annotations
 from collections import deque
 from typing import Dict, List, Set
 
-from .config import Cell, GenConfig, RoomType
+from .config import TERMINAL_TYPES, GenConfig, RoomId, RoomType
 
 __all__ = ["validate"]
 
 
-def _reachable(floor) -> Set[Cell]:
-    start = floor.config.spawn
-    seen = {start}
-    q = deque([start])
+def _reachable(floor) -> Set[RoomId]:
+    seen = {floor.spawn}
+    q = deque([floor.spawn])
     while q:
         cur = q.popleft()
         for nxt in floor.linked(cur):
@@ -30,46 +29,56 @@ def _reachable(floor) -> Set[Cell]:
 def validate(floor) -> List[str]:
     cfg: GenConfig = floor.config
     errors: List[str] = []
-    rooms = set(floor.rooms())
+    rooms = floor.rooms_by_id
 
-    # 1. Якорные комнаты на местах.
-    if floor.type_at(cfg.spawn) is not RoomType.SPAWN:
-        errors.append("спавн не на своей ячейке")
-    if floor.type_at(cfg.boss) is not RoomType.BOSS:
-        errors.append("босс не на своей ячейке")
+    # 1. Якорные комнаты на месте и в единственном экземпляре.
+    if floor.type_at(floor.spawn) is not RoomType.SPAWN:
+        errors.append("спавн потерял свой тип")
+    if floor.type_at(floor.boss) is not RoomType.BOSS:
+        errors.append("босс потерял свой тип")
     if floor.type_at(floor.stairs) is not RoomType.STAIRS:
-        errors.append("лестница не на своей ячейке")
-    if floor.stairs not in list(cfg.stairs_candidates):
-        errors.append(f"лестница в недопустимой ячейке {floor.stairs}")
+        errors.append("лестница потеряла свой тип")
 
-    # 2. Двери — только между ортогональными соседями и только между комнатами.
-    for door in floor.doors:
-        a, b = tuple(door)
-        if abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1:
-            errors.append(f"дверь не между соседями: {a}–{b}")
-        if a not in rooms or b not in rooms:
-            errors.append(f"дверь ведёт в пустую ячейку: {a}–{b}")
+    # 2. Геометрия: комнаты не пересекаются, перемычки не режут чужие комнаты.
+    ids = sorted(rooms)
+    for i, a_id in enumerate(ids):
+        for b_id in ids[i + 1:]:
+            if rooms[a_id].overlaps(rooms[b_id]):
+                errors.append(f"комнаты {a_id} и {b_id} пересекаются")
+    for door, corridor in floor.corridors.items():
+        for rid, room in rooms.items():
+            if rid not in door and corridor.hits(room):
+                errors.append(f"перемычка {sorted(door)} проходит сквозь комнату {rid}")
+        if corridor.w <= 0 or corridor.h <= 0:
+            errors.append(f"вырожденная перемычка {sorted(door)}")
 
-    # 3. Лестница доступна только через босса.
-    stairs_links = floor.linked(floor.stairs)
-    if stairs_links != [cfg.boss] and stairs_links != sorted([cfg.boss]):
-        errors.append(f"лестница соединена не только с боссом: {stairs_links}")
-    boss_links = [c for c in floor.linked(cfg.boss) if c != floor.stairs]
-    if len(boss_links) != 1:
-        errors.append(f"у босса должен быть ровно один вход, а их {len(boss_links)}")
+    # 3. Лестница доступна только через комнату босса.
+    if floor.linked(floor.stairs) != [floor.boss]:
+        errors.append(f"лестница соединена не только с боссом: {floor.linked(floor.stairs)}")
+    without_boss = {floor.spawn}
+    stack = [floor.spawn]
+    while stack:
+        cur = stack.pop()
+        for nxt in floor.linked(cur):
+            if nxt == floor.boss or nxt in without_boss:
+                continue
+            without_boss.add(nxt)
+            stack.append(nxt)
+    if floor.stairs in without_boss:
+        errors.append("на лестницу можно попасть мимо босса")
 
-    # 4. Связность: всё достижимо от спавна, путь до босса есть, островков нет.
+    # 4. Связность: всё достижимо от спавна, изолированных комнат нет.
     seen = _reachable(floor)
-    if cfg.boss not in seen:
+    if floor.boss not in seen:
         errors.append("нет пути от спавна до босса")
-    orphans = rooms - seen
+    orphans = set(rooms) - seen
     if orphans:
         errors.append(f"изолированные комнаты: {sorted(orphans)}")
-    for cell in rooms:
-        if floor.degree(cell) == 0:
-            errors.append(f"комната без выходов: {cell}")
+    for rid in rooms:
+        if floor.degree(rid) == 0:
+            errors.append(f"комната без выходов: {rid}")
 
-    # 5. Количество комнат и лимиты типов (ГДД 3.1 и 3.2).
+    # 5. Состав этажа (ГДД 3.1 и 3.2).
     total = len(rooms)
     lo, hi = cfg.total_rooms
     if not lo <= total <= hi:
@@ -81,21 +90,16 @@ def validate(floor) -> List[str]:
             errors.append(f"{room_type.value}: {n}, требуется {cap_lo}–{cap_hi}")
 
     # 6. Тупиковые награды остаются тупиками.
-    from .config import TERMINAL_TYPES
+    for rid, room in rooms.items():
+        if room.type in TERMINAL_TYPES and floor.degree(rid) != 1:
+            errors.append(f"{room.type.value} {rid} не тупик (степень {floor.degree(rid)})")
 
-    for cell, room_type in floor.grid.items():
-        if room_type in TERMINAL_TYPES and floor.degree(cell) != 1:
-            errors.append(f"{room_type.value} {cell} не тупик (степень {floor.degree(cell)})")
-
-    # 7. Основной путь — настоящий путь по дверям от спавна до босса.
-    path = floor.main_path
-    if not path or path[0] != cfg.spawn or path[-1] != cfg.boss:
-        errors.append("основной путь не соединяет спавн и босса")
-    else:
-        if len(set(path)) != len(path):
-            errors.append("основной путь самопересекается")
-        for a, b in zip(path, path[1:]):
-            if frozenset((a, b)) not in floor.doors:
-                errors.append(f"на основном пути нет двери {a}–{b}")
+    # 7. Обязательный маршрут до босса — ровно та длина, что просит ГДД 3.1.
+    path = floor.critical_path()
+    spine_lo, spine_hi = cfg.spine_rooms
+    if not path:
+        errors.append("маршрут до босса не найден")
+    elif not spine_lo <= len(path) <= spine_hi:
+        errors.append(f"до босса {len(path)} комнат, требуется {spine_lo}–{spine_hi}")
 
     return errors

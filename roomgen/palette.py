@@ -57,7 +57,6 @@ class RoomStyle(NamedTuple):
 
 
 STYLES: Dict[RoomType, RoomStyle] = {
-    RoomType.EMPTY:     RoomStyle(SURFACE, "#242421", TEXT_MUTED, 1.0, "—"),
     RoomType.SPAWN:     RoomStyle(BONE, BONE, "#0b0b0b", 1.6, "каркас"),
     RoomType.NORMAL:    RoomStyle(GRAY_ROOM, GRAY_EDGE, TEXT_SECONDARY, 1.2, "каркас"),
     RoomType.BOSS:      RoomStyle(VOID, BONE, BONE, 2.6, "каркас"),

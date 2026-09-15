@@ -1,11 +1,20 @@
-"""Генерация этажа «Equation Dodge» — 8 шагов из ГДД 3.4.
+"""Генерация этажа «Equation Dodge»: свободная упаковка комнат.
 
-Алгоритм детерминирован по сиду: generate(seed) всегда даёт один и тот же этаж.
-Зависимостей нет (только stdlib) — модуль переносится в GDScript один-в-один.
+Сетки нет. Этаж выращивается от спавна: каждая новая комната пристраивается к
+уже стоящей с одной из четырёх сторон, на коротком коридоре, и принимается,
+только если её прямоугольник ни с чем не пересёкся. Форма этажа получается из
+порядка роста и размеров комнат, а не из ячеек — как на концепт-схеме.
 
-Модель связей: двери хранятся ЯВНО (set рёбер), а не выводятся из соседства.
-Иначе шаг 7 («заполнить пустые ячейки») склеил бы тупики в коридоры и убил бы
-всю схему «награда в конце тупика» из шага 4.
+Порядок построения:
+  1. состав этажа по лимитам ГДД 3.2;
+  2. хребет: обязательный маршрут спавн → босс длиной 5–6 комнат (ГДД 3.1);
+  3. лестничная площадка — только от комнаты босса;
+  4. ответвления до нужного числа комнат, на концах — сундук/столовая/толчок;
+  5. усложнённые и ивентовая комнаты;
+  6. петли — лишние связи, не укорачивающие маршрут до босса;
+  7. проверка (validation.py).
+
+Зависимостей нет, только stdlib: модуль переносится в GDScript один в один.
 """
 
 from __future__ import annotations
@@ -20,63 +29,139 @@ from .config import (
     ROOM_SECONDS,
     TERMINAL_TYPES,
     TRANSITION_SECONDS,
-    Cell,
     GenConfig,
+    RoomId,
     RoomType,
 )
 
-Door = FrozenSet[Cell]
+Door = FrozenSet[RoomId]
+
+#: Четыре стороны: имя → (dx, dy) в тайлах.
+DIRECTIONS: Dict[str, Tuple[int, int]] = {
+    "E": (1, 0), "W": (-1, 0), "S": (0, 1), "N": (0, -1),
+}
+OPPOSITE = {"E": "W", "W": "E", "S": "N", "N": "S"}
 
 
 class GenerationError(RuntimeError):
     """Не удалось собрать корректный этаж за max_attempts попыток."""
 
 
+@dataclass(frozen=True)
+class Room:
+    """Комната как прямоугольник в тайлах. Стены входят в размер."""
+
+    id: RoomId
+    type: RoomType
+    x: int
+    y: int
+    w: int
+    h: int
+
+    @property
+    def x2(self) -> int:
+        return self.x + self.w
+
+    @property
+    def y2(self) -> int:
+        return self.y + self.h
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        return self.x + self.w // 2, self.y + self.h // 2
+
+    def moved(self, dx: int, dy: int) -> "Room":
+        return Room(self.id, self.type, self.x + dx, self.y + dy, self.w, self.h)
+
+    def retyped(self, room_type: RoomType) -> "Room":
+        return Room(self.id, room_type, self.x, self.y, self.w, self.h)
+
+    def overlaps(self, other: "Room", margin: int = 0) -> bool:
+        return not (
+            self.x2 + margin <= other.x or other.x2 + margin <= self.x
+            or self.y2 + margin <= other.y or other.y2 + margin <= self.y
+        )
+
+
+@dataclass(frozen=True)
+class Corridor:
+    """Прямая перемычка между стенами двух комнат."""
+
+    a: RoomId
+    b: RoomId
+    axis: str      # "h" — горизонтальная перемычка, "v" — вертикальная
+    x: int
+    y: int
+    w: int
+    h: int
+
+    @property
+    def x2(self) -> int:
+        return self.x + self.w
+
+    @property
+    def y2(self) -> int:
+        return self.y + self.h
+
+    def moved(self, dx: int, dy: int) -> "Corridor":
+        return Corridor(self.a, self.b, self.axis, self.x + dx, self.y + dy, self.w, self.h)
+
+    def hits(self, room: Room, margin: int = 0) -> bool:
+        return not (
+            self.x2 + margin <= room.x or room.x2 + margin <= self.x
+            or self.y2 + margin <= room.y or room.y2 + margin <= self.y
+        )
+
+
 @dataclass
 class Floor:
-    """Результат генерации: сетка типов + явный набор дверей."""
+    """Готовый этаж: комнаты, перемычки и обязательный маршрут до босса."""
 
-    grid: Dict[Cell, RoomType]
-    doors: Set[Door]
-    main_path: List[Cell]
-    stairs: Cell
+    rooms_by_id: Dict[RoomId, Room]
+    corridors: Dict[Door, Corridor]
+    spine: List[RoomId]
+    spawn: RoomId
+    boss: RoomId
+    stairs: RoomId
     seed: int
     attempts: int
     config: GenConfig
-    branch_chance: float = 0.0
+    width: int = 0
+    height: int = 0
 
     # --- доступ -----------------------------------------------------------
-    def type_at(self, cell: Cell) -> RoomType:
-        return self.grid.get(cell, RoomType.EMPTY)
+    @property
+    def doors(self) -> Set[Door]:
+        return set(self.corridors)
 
-    def rooms(self) -> List[Cell]:
-        return [c for c, t in self.grid.items() if t.is_room]
+    def rooms(self) -> List[RoomId]:
+        return sorted(self.rooms_by_id)
 
-    def linked(self, cell: Cell) -> List[Cell]:
-        out = []
-        for door in self.doors:
-            if cell in door:
-                a, b = tuple(door)
-                out.append(b if a == cell else a)
+    def room(self, rid: RoomId) -> Room:
+        return self.rooms_by_id[rid]
+
+    def type_at(self, rid: RoomId) -> RoomType:
+        return self.rooms_by_id[rid].type
+
+    def linked(self, rid: RoomId) -> List[RoomId]:
+        out = [next(iter(d - {rid})) for d in self.corridors if rid in d]
         return sorted(out)
 
-    def degree(self, cell: Cell) -> int:
-        return sum(1 for d in self.doors if cell in d)
+    def degree(self, rid: RoomId) -> int:
+        return sum(1 for d in self.corridors if rid in d)
 
-    def is_dead_end(self, cell: Cell) -> bool:
-        return self.degree(cell) == 1
+    def is_dead_end(self, rid: RoomId) -> bool:
+        return self.degree(rid) == 1
 
     def counts(self) -> Dict[RoomType, int]:
         res: Dict[RoomType, int] = {}
-        for t in self.grid.values():
-            if t.is_room:
-                res[t] = res.get(t, 0) + 1
+        for room in self.rooms_by_id.values():
+            res[room.type] = res.get(room.type, 0) + 1
         return res
 
-    def distances_from_spawn(self) -> Dict[Cell, int]:
-        start = self.config.spawn
-        dist = {start: 0}
-        q = deque([start])
+    def distances_from_spawn(self) -> Dict[RoomId, int]:
+        dist = {self.spawn: 0}
+        q = deque([self.spawn])
         while q:
             cur = q.popleft()
             for nxt in self.linked(cur):
@@ -85,37 +170,35 @@ class Floor:
                     q.append(nxt)
         return dist
 
-    def critical_path(self) -> List[Cell]:
-        """Кратчайший путь спавн → босс по дверям (то, что игрок обязан пройти)."""
-        start, goal = self.config.spawn, self.config.boss
-        prev: Dict[Cell, Optional[Cell]] = {start: None}
-        q = deque([start])
+    def critical_path(self) -> List[RoomId]:
+        """Кратчайший маршрут спавн → босс по перемычкам."""
+        prev: Dict[RoomId, Optional[RoomId]] = {self.spawn: None}
+        q = deque([self.spawn])
         while q:
             cur = q.popleft()
-            if cur == goal:
+            if cur == self.boss:
                 break
             for nxt in self.linked(cur):
                 if nxt not in prev:
                     prev[nxt] = cur
                     q.append(nxt)
-        if goal not in prev:
+        if self.boss not in prev:
             return []
-        path, node = [], goal
+        path, node = [], self.boss
         while node is not None:
             path.append(node)
             node = prev[node]
         return list(reversed(path))
 
     # --- тайминг (ГДД «Тайминг прохождения этажа») ------------------------
-    def time_estimate(self, cells: Optional[Sequence[Cell]] = None) -> Tuple[float, float]:
-        """(мин, макс) секунд на список комнат; по умолчанию — весь этаж на 100%."""
-        cells = list(self.rooms()) if cells is None else list(cells)
+    def time_estimate(self, ids: Optional[Sequence[RoomId]] = None) -> Tuple[float, float]:
+        ids = list(self.rooms()) if ids is None else list(ids)
         lo = hi = 0.0
-        for cell in cells:
-            a, b = ROOM_SECONDS[self.type_at(cell)]
+        for rid in ids:
+            a, b = ROOM_SECONDS[self.type_at(rid)]
             lo += a
             hi += b
-        moves = max(len(cells) - 1, 0)
+        moves = max(len(ids) - 1, 0)
         return lo + moves * TRANSITION_SECONDS, hi + moves * TRANSITION_SECONDS
 
 
@@ -123,26 +206,12 @@ class Floor:
 # Вспомогательное
 # ---------------------------------------------------------------------------
 
-def _manhattan(a: Cell, b: Cell) -> int:
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-
-def _weighted_shuffle(rng: random.Random, items: Sequence, weights: Sequence[float]) -> List:
-    """Перемешивание без возврата пропорционально весам (ключи Эфраимидиса)."""
-    keyed = []
-    for item, w in zip(items, weights):
-        w = max(w, 1e-9)
-        keyed.append((rng.random() ** (1.0 / w), item))
-    keyed.sort(key=lambda kv: kv[0], reverse=True)
-    return [item for _, item in keyed]
-
-
 def _pick_weighted(rng: random.Random, pairs: Sequence[Tuple]) -> object:
     total = sum(w for _, w in pairs)
     roll = rng.random() * total
     upto = 0.0
-    for value, w in pairs:
-        upto += w
+    for value, weight in pairs:
+        upto += weight
         if roll <= upto:
             return value
     return pairs[-1][0]
@@ -156,14 +225,18 @@ class _Builder:
     def __init__(self, cfg: GenConfig, rng: random.Random):
         self.cfg = cfg
         self.rng = rng
-        self.grid: Dict[Cell, RoomType] = {
-            (r, c): RoomType.EMPTY for r in range(cfg.height) for c in range(cfg.width)
-        }
-        self.doors: Set[Door] = set()
+        self.rooms: Dict[RoomId, Room] = {}
+        self.corridors: Dict[Door, Corridor] = {}
         self.counts: Dict[RoomType, int] = {}
-        self.main_path: List[Cell] = []
-        self.stairs: Cell = cfg.stairs_candidates[0]
-        self.branch_chance = 0.0
+        self.spine: List[RoomId] = []
+        self.terminal_queue: List[RoomType] = []
+        self.hard_on_spine = 0
+        self._next_id = 0
+        # Куда «тянется» этаж: босс уходит в эту сторону от спавна.
+        angle = rng.random() * 6.283185
+        import math
+
+        self.drift = (math.cos(angle), math.sin(angle))
 
     # --- примитивы --------------------------------------------------------
     def cap_of(self, t: RoomType) -> int:
@@ -172,304 +245,335 @@ class _Builder:
     def can_place(self, t: RoomType) -> bool:
         return self.counts.get(t, 0) < self.cap_of(t)
 
-    def place(self, cell: Cell, t: RoomType) -> bool:
-        """Поставить комнату с учётом лимита типа. False — лимит исчерпан."""
-        if not self.can_place(t):
-            return False
-        old = self.grid[cell]
-        if old.is_room:
-            self.counts[old] -= 1
-        self.grid[cell] = t
-        self.counts[t] = self.counts.get(t, 0) + 1
+    def _size(self, t: RoomType) -> Tuple[int, int]:
+        (wlo, whi), (hlo, hhi) = self.cfg.sizes[t]
+        return self.rng.randint(wlo, whi), self.rng.randint(hlo, hhi)
+
+    def _fits(self, room: Room, corridor: Optional[Corridor]) -> bool:
+        margin = self.cfg.room_margin
+        for other in self.rooms.values():
+            if room.overlaps(other, margin):
+                return False
+            if corridor is not None and other.id not in (corridor.a, corridor.b) \
+                    and corridor.hits(other, 1):
+                return False
+        if corridor is not None:
+            for existing in self.corridors.values():
+                if _boxes_touch(corridor, existing, 1):
+                    return False
         return True
 
-    def retype(self, cell: Cell, t: RoomType) -> bool:
-        return self.place(cell, t)
+    def attach(self, anchor_id: RoomId, room_type: RoomType,
+               prefer_drift: bool = False) -> Optional[RoomId]:
+        """Пристроить комнату к anchor с любой стороны. None — не поместилась."""
+        if not self.can_place(room_type):
+            return None
+        anchor = self.rooms[anchor_id]
+        order = self._direction_order(anchor, prefer_drift)
+        for _ in range(self.cfg.placement_tries):
+            side = order[self.rng.randrange(len(order))] if order else None
+            if side is None:
+                return None
+            w, h = self._size(room_type)
+            placed = self._try_side(anchor, side, w, h, room_type)
+            if placed is not None:
+                room, corridor = placed
+                self.rooms[room.id] = room
+                self.corridors[frozenset((anchor_id, room.id))] = corridor
+                self.counts[room_type] = self.counts.get(room_type, 0) + 1
+                return room.id
+        return None
 
-    def connect(self, a: Cell, b: Cell) -> None:
-        assert _manhattan(a, b) == 1, "дверь только между ортогональными соседями"
-        self.doors.add(frozenset((a, b)))
-
-    def is_free(self, cell: Cell) -> bool:
-        return self.grid[cell] is RoomType.EMPTY
-
-    def occupied_neighbors(self, cell: Cell) -> List[Cell]:
-        return [n for n in self.cfg.neighbors(cell) if not self.is_free(n)]
-
-    def room_count(self) -> int:
-        return sum(1 for t in self.grid.values() if t.is_room)
-
-    # --- Шаг 2: якорные комнаты ------------------------------------------
-    def step2_anchors(self) -> None:
-        cfg = self.cfg
-        self.place(cfg.spawn, RoomType.SPAWN)
-        self.place(cfg.boss, RoomType.BOSS)
-        self.stairs = self.rng.choice(list(cfg.stairs_candidates))
-        self.place(self.stairs, RoomType.STAIRS)
-        # Лестница соединена ТОЛЬКО с боссом: пройти на следующий этаж
-        # можно лишь через боссфайт (ГДД 3.2 «всегда после босса»).
-        self.connect(self.stairs, cfg.boss)
-
-    # --- Шаг 3: основной путь --------------------------------------------
-    def step3_main_path(self) -> bool:
-        cfg = self.cfg
-        start, goal = cfg.spawn, cfg.boss
-        base = _manhattan(start, goal)
-        lengths = [
-            (n, w)
-            for n, w in cfg.main_path_lengths
-            if (n - 1) >= base and (n - 1 - base) % 2 == 0
-        ]
-        if not lengths:
-            return False
-        order: List[int] = []
-        pool = list(lengths)
+    def _direction_order(self, anchor: Room, prefer_drift: bool) -> List[str]:
+        """Стороны в случайном порядке; для хребта — с уклоном «от спавна»."""
+        sides = list(DIRECTIONS)
+        if not prefer_drift:
+            self.rng.shuffle(sides)
+            return sides
+        dx, dy = self.drift
+        weighted = []
+        for side in sides:
+            vx, vy = DIRECTIONS[side]
+            weighted.append((side, max(0.15, 1.0 + 2.2 * (vx * dx + vy * dy))))
+        order: List[str] = []
+        pool = list(weighted)
         while pool:
             chosen = _pick_weighted(self.rng, pool)
             order.append(chosen)
             pool = [p for p in pool if p[0] != chosen]
+        return order
 
-        for target in order:
-            path = self._search_path(start, goal, target)
-            if path:
-                self.main_path = path
-                for cell in path[1:-1]:
-                    if not self.place(cell, RoomType.NORMAL):
-                        return False
-                for a, b in zip(path, path[1:]):
-                    self.connect(a, b)
-                return True
-        return False
+    def _try_side(self, anchor: Room, side: str, w: int, h: int,
+                  room_type: RoomType) -> Optional[Tuple[Room, Corridor]]:
+        cfg = self.cfg
+        gap = self.rng.randint(*cfg.corridor_length)
+        need = cfg.corridor_width + 2          # проём плюс по стене с каждой стороны
 
-    def _search_path(self, start: Cell, goal: Cell, target_cells: int) -> Optional[List[Cell]]:
-        """Самонепересекающийся случайный путь ровно из target_cells клеток.
+        if side in ("E", "W"):
+            if min(anchor.h, h) < need:
+                return None
+            lo = anchor.y - (h - need)
+            hi = anchor.y + anchor.h - need
+            y = self.rng.randint(lo, hi)
+            x = anchor.x2 + gap if side == "E" else anchor.x - gap - w
+            room = Room(self._next_id, room_type, x, y, w, h)
+            o0, o1 = max(anchor.y, y) + 1, min(anchor.y2, y + h) - 1
+            if o1 - o0 < cfg.corridor_width:
+                return None
+            cy = self.rng.randint(o0, o1 - cfg.corridor_width)
+            cx = anchor.x2 if side == "E" else x + w
+            corridor = Corridor(anchor.id, room.id, "h", cx, cy, gap, cfg.corridor_width)
+        else:
+            if min(anchor.w, w) < need:
+                return None
+            lo = anchor.x - (w - need)
+            hi = anchor.x + anchor.w - need
+            x = self.rng.randint(lo, hi)
+            y = anchor.y2 + gap if side == "S" else anchor.y - gap - h
+            room = Room(self._next_id, room_type, x, y, w, h)
+            o0, o1 = max(anchor.x, x) + 1, min(anchor.x2, x + w) - 1
+            if o1 - o0 < cfg.corridor_width:
+                return None
+            cx = self.rng.randint(o0, o1 - cfg.corridor_width)
+            cy = anchor.y2 if side == "S" else y + h
+            corridor = Corridor(anchor.id, room.id, "v", cx, cy, cfg.corridor_width, gap)
 
-        Обход в глубину с откатом; ветки, из которых до босса уже не дойти
-        за оставшийся бюджет шагов (или не сойдётся чётность), отсекаются —
-        поэтому «перезапуск генерации» из ГДД здесь почти никогда не нужен.
+        if not self._fits(room, corridor):
+            return None
+        self._next_id += 1
+        return room, corridor
+
+    # --- шаги -------------------------------------------------------------
+    def seed_spawn(self) -> RoomId:
+        room = Room(self._next_id, RoomType.SPAWN, 0, 0, *self._size(RoomType.SPAWN))
+        self._next_id += 1
+        self.rooms[room.id] = room
+        self.counts[RoomType.SPAWN] = 1
+        self.spine = [room.id]
+        return room.id
+
+    def plan_specials(self) -> None:
+        """Заранее решить, каких особых комнат сколько и где.
+
+        Тип выбирается ДО постановки, потому что от типа зависит размер:
+        сундук маленький, усложнённая большая, столовая широкая. Если менять
+        тип уже поставленной комнате, размер остаётся чужим — на концепт-схеме
+        размер как раз и читается как тип.
         """
         cfg = self.cfg
-        blocked = {self.stairs}
-        path: List[Cell] = [start]
-        visited: Set[Cell] = {start}
+        hard_total = self.rng.randint(*cfg.hard_rooms)
+        # ГДД 3.4 шаг 5: тупик предпочтительнее, основной путь — реже.
+        self.hard_on_spine = sum(
+            1 for _ in range(hard_total)
+            if self.rng.random() >= cfg.hard_dead_end_preference
+        )
+        queue: List[RoomType] = [RoomType.CHEST] * cfg.caps[RoomType.CHEST][0]
+        queue += [RoomType.HARD] * (hard_total - self.hard_on_spine)
+        if self.rng.random() < cfg.event_chance:
+            queue.append(RoomType.EVENT)
+        self.rng.shuffle(queue)
+        self.terminal_queue = queue
 
-        def rec() -> bool:
-            cur = path[-1]
-            if cur == goal:
-                return len(path) == target_cells
-            moves_left = target_cells - len(path)
-            if moves_left <= 0:
+    def grow_spine(self) -> bool:
+        """Обязательный маршрут спавн → босс длиной 5–6 комнат (ГДД 3.1)."""
+        target = self.rng.randint(*self.cfg.spine_rooms)
+        middle = target - 2
+        hard_slots = set(self.rng.sample(range(middle), min(self.hard_on_spine, middle))) \
+            if middle else set()
+        for i in range(middle):
+            room_type = RoomType.HARD if i in hard_slots else RoomType.NORMAL
+            new_id = self.attach(self.spine[-1], room_type, prefer_drift=True)
+            if new_id is None and room_type is RoomType.HARD:
+                new_id = self.attach(self.spine[-1], RoomType.NORMAL, prefer_drift=True)
+            if new_id is None:
                 return False
-            cands = [
-                n for n in cfg.neighbors(cur)
-                if n not in visited and n not in blocked and (self.is_free(n) or n == goal)
-            ]
-            weights = [
-                cfg.toward_boss_weight if _manhattan(n, goal) < _manhattan(cur, goal) else 1.0
-                for n in cands
-            ]
-            for nxt in _weighted_shuffle(self.rng, cands, weights):
-                rest = moves_left - 1
-                dist = _manhattan(nxt, goal)
-                if dist > rest or (rest - dist) % 2 != 0:
-                    continue  # отсечение: не дойти или не сойдётся чётность
-                if nxt == goal and rest != 0:
-                    continue  # пришли к боссу раньше запланированной длины
-                path.append(nxt)
-                visited.add(nxt)
-                if rec():
-                    return True
-                path.pop()
-                visited.discard(nxt)
+            self.spine.append(new_id)
+        boss_id = self.attach(self.spine[-1], RoomType.BOSS, prefer_drift=True)
+        if boss_id is None:
             return False
+        self.spine.append(boss_id)
+        return True
 
-        return list(path) if rec() else None
+    def attach_stairs(self, boss_id: RoomId) -> Optional[RoomId]:
+        """Лестница висит на боссе и больше ни на ком (ГДД 3.2)."""
+        return self.attach(boss_id, RoomType.STAIRS)
 
-    # --- Шаг 4: ответвления-тупики ---------------------------------------
-    def step4_branches(self) -> None:
+    def grow_branches(self, target_rooms: int) -> None:
         cfg = self.cfg
-        lo, hi = cfg.branch_chance
-        self.branch_chance = self.rng.uniform(lo, hi)
-        # Спавн и босс из ГДД исключены; лестница — тоже (она только за боссом).
-        anchors = [c for c in self.main_path[1:-1]]
-        self.rng.shuffle(anchors)
-        for anchor in anchors:
-            if self.rng.random() >= self.branch_chance:
-                continue
-            self._grow_branch(anchor)
-
-    def _growable(self, cell: Cell, parent: Cell) -> bool:
-        """Клетка годится для тупика, если она пуста.
-
-        Двери хранятся явно, поэтому физическое соседство с чужой комнатой не
-        создаёт прохода: цепочка остаётся деревом, даже если вьётся вплотную
-        к основному пути. Требование «единственный занятый сосед» отсекало бы
-        ~60% ответвлений на извилистых путях.
-        """
-        del parent  # соседство больше не ограничивает рост
-        return self.is_free(cell)
-
-    def _grow_branch(self, anchor: Cell) -> None:
-        cfg = self.cfg
-        length = self.rng.randint(*cfg.branch_length)
-        chain: List[Cell] = []
-        cur = anchor
-        for _ in range(length):
-            options = [n for n in cfg.neighbors(cur) if self._growable(n, cur)]
-            if not options:
+        blocked: Set[RoomId] = set()
+        while len(self.rooms) < target_rooms:
+            anchors = [
+                rid for rid, room in self.rooms.items()
+                if room.type not in PROTECTED_TYPES and rid not in blocked
+            ]
+            if not anchors:
                 break
-            nxt = self.rng.choice(options)
-            if not self.place(nxt, RoomType.NORMAL):
-                break  # упёрлись в лимит обычных комнат
-            self.connect(cur, nxt)
-            chain.append(nxt)
-            cur = nxt
-        if not chain:
-            return
-        # Крайняя комната тупика получает специальный тип (ГДД: 40/30/30).
-        terminal = chain[-1]
-        wanted = _pick_weighted(self.rng, list(cfg.branch_terminal_weights))
-        if self.can_place(wanted):
-            self.retype(terminal, wanted)
-        # иначе остаётся обычной — ровно как требует ГДД, шаг 4.
+            anchor = self.rng.choice(sorted(anchors))
+            chain = self.rng.randint(*cfg.branch_length)
+            terminal = self._next_terminal()
+            cur, grown, placed_terminal = anchor, [], False
+            for step in range(chain):
+                if len(self.rooms) >= target_rooms:
+                    break
+                last = step == chain - 1
+                want = terminal if last else RoomType.NORMAL
+                new_id = self.attach(cur, want)
+                if new_id is None and last:
+                    new_id = self.attach(cur, RoomType.NORMAL)  # терминал не влез
+                elif new_id is not None and last:
+                    placed_terminal = want is terminal
+                if new_id is None:
+                    break
+                grown.append(new_id)
+                cur = new_id
+            if terminal not in (RoomType.NORMAL, None) and not placed_terminal:
+                self.terminal_queue.append(terminal)   # вернём в очередь
+            if not grown:
+                blocked.add(anchor)
 
-    # --- Шаг 5: усложнённые комнаты ---------------------------------------
-    def step5_hard_rooms(self) -> None:
-        cfg = self.cfg
-        want = self.rng.randint(*cfg.hard_rooms)
-        for _ in range(want):
-            if not self.can_place(RoomType.HARD):
-                break
-            dead_ends, on_path = [], []
-            for cell, t in self.grid.items():
-                if t is not RoomType.NORMAL:
-                    continue
-                (dead_ends if self._degree(cell) == 1 else on_path).append(cell)
-            pool = dead_ends
-            if not pool or (on_path and self.rng.random() >= cfg.hard_dead_end_preference):
-                pool = on_path or dead_ends
-            if not pool:
-                break
-            self.retype(self.rng.choice(sorted(pool)), RoomType.HARD)
+    def _next_terminal(self) -> RoomType:
+        """Чем закончить тупик: сперва обязательные типы, потом ГДД 40/30/30."""
+        while self.terminal_queue:
+            wanted = self.terminal_queue.pop()
+            if self.can_place(wanted):
+                return wanted
+        wanted = _pick_weighted(self.rng, list(self.cfg.branch_terminal_weights))
+        return wanted if self.can_place(wanted) else RoomType.NORMAL
 
-    def _degree(self, cell: Cell) -> int:
-        return sum(1 for d in self.doors if cell in d)
+    def _retype(self, rid: RoomId, room_type: RoomType) -> None:
+        old = self.rooms[rid].type
+        self.counts[old] = self.counts.get(old, 1) - 1
+        self.rooms[rid] = self.rooms[rid].retyped(room_type)
+        self.counts[room_type] = self.counts.get(room_type, 0) + 1
 
-    # --- Шаг 6: ивентовая комната -----------------------------------------
-    def step6_event_room(self) -> None:
-        if self.rng.random() >= self.cfg.event_chance:
-            return
-        on_path = set(self.main_path)
-        pool = [
-            cell for cell, t in self.grid.items()
-            if t is RoomType.NORMAL and cell not in on_path and self._degree(cell) == 1
-        ]
-        if not pool:
-            return
-        self.retype(self.rng.choice(sorted(pool)), RoomType.EVENT)
+    def _degree(self, rid: RoomId) -> int:
+        return sum(1 for d in self.corridors if rid in d)
 
-    # --- Шаг 7: добор комнат + петли --------------------------------------
-    def step7_fill(self, target: Optional[int] = None) -> None:
-        cfg = self.cfg
-        target = self._target_room_count() if target is None else target
-        while self.room_count() < target:
-            options: List[Tuple[Cell, List[Cell]]] = []
-            for cell, t in self.grid.items():
-                if t is not RoomType.EMPTY:
-                    continue
-                parents = [
-                    n for n in self.occupied_neighbors(cell)
-                    if self.grid[n] not in PROTECTED_TYPES
-                ]
-                if parents:
-                    options.append((cell, parents))
-            if not options:
-                break  # присоединяться не к чему — ГДД: «остаются пустыми»
-            cell, parents = self.rng.choice(sorted(options))
-            if not self.place(cell, RoomType.NORMAL):
-                break  # лимит обычных комнат исчерпан
-            self.connect(cell, self.rng.choice(parents))
+    def add_loops(self, boss_id: RoomId) -> None:
+        """Лишние связи между уже стоящими комнатами — развилки из ГДД 3.3.
 
-    def _target_room_count(self) -> int:
-        """ГДД: 16–22, в среднем 18–20 — треугольное распределение, а не ровное."""
-        lo, hi = self.cfg.total_rooms
-        peak = self.cfg.total_rooms_peak
-        return int(round(self.rng.triangular(lo, hi, peak)))
-
-    def _add_loop_doors(self) -> None:
-        """Развилки из ГДД 3.3: часть соседних комнат получает вторую дверь.
-
-        Тупики и защищённые типы не участвуют, иначе «сундук в конце тупика»
-        и правило «лестница только за боссом» перестают работать.
+        Петля принимается, только если она не укорачивает маршрут до босса:
+        обязательные 5–6 комнат должны остаться обязательными.
         """
         cfg = self.cfg
         loopable = {RoomType.SPAWN, RoomType.NORMAL, RoomType.HARD}
-        for cell, t in sorted(self.grid.items()):
-            if t not in loopable:
+        base_dist = self._distance(self.spine[0], boss_id)
+        ids = sorted(self.rooms)
+        for i, a_id in enumerate(ids):
+            if self.rooms[a_id].type not in loopable:
                 continue
-            for n in cfg.neighbors(cell):
-                if n <= cell or self.grid[n] not in loopable:
+            for b_id in ids[i + 1:]:
+                if self.rooms[b_id].type not in loopable:
                     continue
-                if frozenset((cell, n)) in self.doors:
+                if frozenset((a_id, b_id)) in self.corridors:
                     continue
-                if self.rng.random() < cfg.loop_door_chance:
-                    self.connect(cell, n)
+                if self.rng.random() >= cfg.loop_chance:
+                    continue
+                corridor = self._between(self.rooms[a_id], self.rooms[b_id])
+                if corridor is None or not self._fits_corridor(corridor):
+                    continue
+                self.corridors[frozenset((a_id, b_id))] = corridor
+                if self._distance(self.spine[0], boss_id) < base_dist:
+                    del self.corridors[frozenset((a_id, b_id))]
 
-    # --- Ремонт минимальных требований ------------------------------------
-    def repair_minimums(self) -> None:
-        """Дотягивает типы до нижних границ ГДД (напр. «сундук: 1–2»)."""
-        for t, (lo, _hi) in self.cfg.caps.items():
-            while self.counts.get(t, 0) < lo:
-                cell = self._best_candidate_for(t)
-                if cell is None:
-                    return
-                self.retype(cell, t)
+    def _between(self, a: Room, b: Room) -> Optional[Corridor]:
+        """Прямая перемычка между двумя комнатами, если они смотрят друг на друга."""
+        cfg = self.cfg
+        width = cfg.corridor_width
+        lo, hi = cfg.loop_corridor_length
+        if a.x2 <= b.x or b.x2 <= a.x:                       # разнесены по X
+            left, right = (a, b) if a.x2 <= b.x else (b, a)
+            gap = right.x - left.x2
+            if not lo <= gap <= hi:
+                return None
+            o0, o1 = max(a.y, b.y) + 1, min(a.y2, b.y2) - 1
+            if o1 - o0 < width:
+                return None
+            y = (o0 + o1 - width) // 2
+            return Corridor(left.id, right.id, "h", left.x2, y, gap, width)
+        if a.y2 <= b.y or b.y2 <= a.y:                       # разнесены по Y
+            top, bottom = (a, b) if a.y2 <= b.y else (b, a)
+            gap = bottom.y - top.y2
+            if not lo <= gap <= hi:
+                return None
+            o0, o1 = max(a.x, b.x) + 1, min(a.x2, b.x2) - 1
+            if o1 - o0 < width:
+                return None
+            x = (o0 + o1 - width) // 2
+            return Corridor(top.id, bottom.id, "v", x, top.y2, width, gap)
+        return None
 
-    def _best_candidate_for(self, t: RoomType) -> Optional[Cell]:
-        on_path = set(self.main_path)
-        normals = [c for c, g in self.grid.items() if g is RoomType.NORMAL]
-        if t in TERMINAL_TYPES:
-            pool = [c for c in normals if self._degree(c) == 1 and c not in on_path]
-            pool = pool or [c for c in normals if self._degree(c) == 1]
-        else:
-            pool = normals
-        return self.rng.choice(sorted(pool)) if pool else None
+    def _fits_corridor(self, corridor: Corridor) -> bool:
+        for room in self.rooms.values():
+            if room.id not in (corridor.a, corridor.b) and corridor.hits(room, 1):
+                return False
+        for existing in self.corridors.values():
+            if _boxes_touch(corridor, existing, 1):
+                return False
+        return True
 
+    def _distance(self, src: RoomId, dst: RoomId) -> int:
+        dist = {src: 0}
+        q = deque([src])
+        while q:
+            cur = q.popleft()
+            if cur == dst:
+                return dist[cur]
+            for door in self.corridors:
+                if cur not in door:
+                    continue
+                nxt = next(iter(door - {cur}))
+                if nxt not in dist:
+                    dist[nxt] = dist[cur] + 1
+                    q.append(nxt)
+        return 10 ** 6
+
+    def normalise(self) -> Tuple[int, int]:
+        """Сдвинуть этаж в положительные координаты и вернуть его размер."""
+        pad = self.cfg.room_margin
+        min_x = min(r.x for r in self.rooms.values()) - pad
+        min_y = min(r.y for r in self.rooms.values()) - pad
+        self.rooms = {rid: room.moved(-min_x, -min_y) for rid, room in self.rooms.items()}
+        self.corridors = {k: c.moved(-min_x, -min_y) for k, c in self.corridors.items()}
+        width = max(r.x2 for r in self.rooms.values()) + pad
+        height = max(r.y2 for r in self.rooms.values()) + pad
+        return width, height
+
+    # --- сборка -----------------------------------------------------------
     def build(self) -> Optional[Floor]:
-        self.step2_anchors()
-        if not self.step3_main_path():
+        self.plan_specials()
+        spawn_id = self.seed_spawn()
+        if not self.grow_spine():
             return None
-        self.step4_branches()
-        # ОТСТУПЛЕНИЕ ОТ ГДД: шаг 7 выполняется раньше шагов 5–6.
-        # В порядке ГДД (4→5→6→7) к моменту выбора ивентовой комнаты тупиков
-        # на этаже почти нет — все терминалы ответвлений уже стали сундуком/
-        # столовой/толчком, — и ивент выпадал на ~1% этажей вместо 50%.
-        # Набор шагов тот же, меняется только момент выбора типа.
-        target = self._target_room_count()
-        self.step7_fill(target)
-        # ОТСТУПЛЕНИЕ ОТ ГДД: шаг 6 идёт перед шагом 5. Оба шага конвертируют
-        # обычные комнаты, но у ивента требование жёстче («тупик вне основного
-        # пути»), а усложнённой комнате тупик лишь «предпочтителен». В порядке
-        # ГДД усложнённые комнаты выедали пул тупиков и ивент падал до ~24%
-        # вместо заявленных 50%.
-        self.step6_event_room()
-        self.step5_hard_rooms()
-        # Шаги 5–6 переводят обычные комнаты в усложнённые/ивентовые и тем
-        # освобождают лимит «обычных» — добираем этаж до целевого размера.
-        self.step7_fill(target)
-        self.repair_minimums()
-        # Развилки ставим последними, по финальной планировке.
-        self._add_loop_doors()
+        boss_id = self.spine[-1]
+        stairs_id = self.attach_stairs(boss_id)
+        if stairs_id is None:
+            return None
+        lo, hi = self.cfg.total_rooms
+        target = int(round(self.rng.triangular(lo, hi, self.cfg.total_rooms_peak)))
+        self.grow_branches(target)
+        self.add_loops(boss_id)
+        width, height = self.normalise()
         return Floor(
-            grid=dict(self.grid),
-            doors=set(self.doors),
-            main_path=list(self.main_path),
-            stairs=self.stairs,
+            rooms_by_id=dict(self.rooms),
+            corridors=dict(self.corridors),
+            spine=list(self.spine),
+            spawn=spawn_id,
+            boss=boss_id,
+            stairs=stairs_id,
             seed=-1,
             attempts=0,
             config=self.cfg,
-            branch_chance=self.branch_chance,
+            width=width,
+            height=height,
         )
+
+
+def _boxes_touch(a, b, margin: int) -> bool:
+    return not (
+        a.x2 + margin <= b.x or b.x2 + margin <= a.x
+        or a.y2 + margin <= b.y or b.y2 + margin <= a.y
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -477,8 +581,8 @@ class _Builder:
 # ---------------------------------------------------------------------------
 
 def generate(seed: int, cfg: Optional[GenConfig] = None) -> Floor:
-    """Сгенерировать этаж. Шаг 8 (проверка связности) — внутри цикла попыток."""
-    from .validation import validate  # локальный импорт: избегаем цикла
+    """Сгенерировать этаж. Проверки — внутри цикла попыток."""
+    from .validation import validate
 
     cfg = cfg or GenConfig()
     for attempt in range(cfg.max_attempts):

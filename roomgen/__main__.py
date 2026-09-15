@@ -4,7 +4,7 @@
   render [--seed N] [--out DIR]     — PNG: схема этажа, лист сидов, статистика
   pixels [--seed N] [--floor N]     — PNG: этаж реальными спрайтами проекта
   export [--seed N] [--out FILE]    — JSON с сеткой тайлов для сцены Godot
-  check  [--count N]                — прогнать N сидов через проверки шага 8
+  check  [--count N]                — прогнать N сидов через проверки
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def cmd_pixels(args) -> int:
                        scale=args.scale, floor_number=args.floor))
     print(render_annotated(floor, os.path.join(args.out, "pixels_annotated.png"),
                            scale=args.scale, floor_number=args.floor))
-    for cell in sorted(floor.rooms()):
+    for cell in floor.rooms():
         if floor.type_at(cell) is RoomType[args.room.upper()]:
             print(render_room(floor, cell, os.path.join(args.out, "pixels_room.png"),
                               floor_number=args.floor))
@@ -75,7 +75,7 @@ def cmd_export(args) -> int:
 def cmd_check(args) -> int:
     cfg = GenConfig()
     failures = 0
-    totals, attempts = [], []
+    totals, attempts, route, loops = [], [], [], []
     presence: Counter = Counter()
     for seed in range(args.count):
         floor = generate(seed, cfg)
@@ -85,19 +85,15 @@ def cmd_check(args) -> int:
             print(f"seed {seed}: {errors}", file=sys.stderr)
         totals.append(len(floor.rooms()))
         attempts.append(floor.attempts)
+        route.append(len(floor.critical_path()))
+        loops.append(len(floor.corridors) - len(floor.rooms()) + 1)
         for room_type in floor.counts():
             presence[room_type] += 1
-    from . import tilemap as tilemap_mod
-
-    sample = min(args.count, 300)
-    forced = [
-        tilemap_mod.rooms_to_boss(f, tilemap_mod.build(f)) + 1
-        for f in (generate(s, cfg) for s in range(sample))
-    ]
     print(f"проверено этажей: {args.count}, с нарушениями: {failures}")
-    print(f"комнат обязательно пройти до босса: "
-          f"min {min(forced)}, среднее {sum(forced)/len(forced):.2f}, max {max(forced)} "
-          f"(ГДД: 5–6, выборка {sample})")
+    print(f"обязательный маршрут до босса: min {min(route)}, "
+          f"среднее {sum(route)/len(route):.2f}, max {max(route)} (ГДД 3.1: 5–6)")
+    print(f"петель (альтернативных маршрутов): среднее {sum(loops)/len(loops):.2f}, "
+          f"max {max(loops)}")
     print(f"комнат на этаже: min {min(totals)}, среднее {sum(totals)/len(totals):.2f}, "
           f"max {max(totals)}")
     print(f"попыток генерации на этаж: среднее {sum(attempts)/len(attempts):.3f}, "
@@ -140,7 +136,7 @@ def main(argv=None) -> int:
     p_export.add_argument("--out", default="out/floor.json")
     p_export.set_defaults(func=cmd_export)
 
-    p_check = sub.add_parser("check", help="прогон проверок шага 8")
+    p_check = sub.add_parser("check", help="прогон проверок на N сидах")
     p_check.add_argument("--count", type=int, default=2000)
     p_check.set_defaults(func=cmd_check)
 

@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from PIL import Image, ImageDraw, ImageFont
 
 from . import tilemap as T
-from .config import RU_NAME, RoomType
+from .config import METERS_PER_TILE, RU_NAME, RoomType
 from .generator import Floor
 from .sprites import MOB_KEYS, TILE_SIZE, Atlas
 
@@ -180,7 +180,7 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None,
             canvas.alpha_composite(sprite, (tx * TILE_SIZE, ty * TILE_SIZE))
 
     # 2. Предметы, герой и враги.
-    for cell in sorted(floor.rooms()):
+    for cell in floor.rooms():
         room_type = floor.type_at(cell)
         placer = _Placer(tm, cell, rng)
 
@@ -242,7 +242,7 @@ def render_room(floor: Floor, cell, path: str, scale: int = 6,
     """Одна комната крупно — видно, как читается тайлсет вблизи."""
     canvas, tm = draw_map(floor, atlas, floor_number)
     x, y, w, h = tm.room_rects[cell]
-    pad = T.HALL
+    pad = 10
     box = ((x - pad) * TILE_SIZE, (y - pad) * TILE_SIZE,
            (x + w + pad) * TILE_SIZE, (y + h + pad) * TILE_SIZE)
     box = (max(box[0], 0), max(box[1], 0),
@@ -291,15 +291,16 @@ def render_annotated(floor: Floor, path: str, scale: int = 2,
     counts = floor.counts()
     d.text((pad, 14), f"Equation Dodge — этаж {floor_number}, seed {floor.seed}",
            font=f_title, fill=INK)
-    forced = T.rooms_to_boss(floor, tm) + 1
+    forced = T.rooms_to_boss(floor, tm)
+    loops = len(floor.corridors) - len(floor.rooms()) + 1
     d.text((pad, 44),
            f"{len(floor.rooms())} комнат · до босса обязательно пройти {forced} "
-           f"(ГДД: 5–6) · сетка {tm.width}×{tm.height} тайлов по {TILE_SIZE} px, "
-           f"кабинет {T.ROOM_W}×{T.ROOM_H} ≈ {T.ROOM_W*0.41:.0f}×{T.ROOM_H*0.41:.0f} м",
+           f"(ГДД: 5–6) · петель {loops} · {tm.width}×{tm.height} тайлов "
+           f"≈ {tm.width*METERS_PER_TILE:.0f}×{tm.height*METERS_PER_TILE:.0f} м",
            font=f_small, fill=INK_MUTED)
 
     # Подписи комнат — поверх верхней стены блока.
-    for cell in sorted(floor.rooms()):
+    for cell in floor.rooms():
         room_type = floor.type_at(cell)
         x, y, w, _h = tm.room_rects[cell]
         label = RU_NAME[room_type]
