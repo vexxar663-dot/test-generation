@@ -65,7 +65,7 @@ ROOM_PROPS: Dict[RoomType, Sequence[Tuple[str, str, int]]] = {
 #: Площадь пола обычного класса в тайлах — опора для числа врагов. Бой в
 #: комнате по ГДД длится 5–15 секунд, поэтому враги считаются от комнаты,
 #: а не от квадратных метров.
-REFERENCE_INTERIOR = 5000
+REFERENCE_INTERIOR = 1250
 
 #: А мебель заполняет площадь, поэтому её плотность привязана к метрам:
 #: столько тайлов пола приходилось на один предмет в комнате прежнего размера.
@@ -284,7 +284,7 @@ def draw_map(floor: Floor, atlas: Optional[Atlas] = None, floor_number: int = 1,
 
 
 def render_floor(floor: Floor, path: str, scale: int = 1, floor_number: int = 1,
-                 atlas: Optional[Atlas] = None, tile_px: int = 4) -> str:
+                 atlas: Optional[Atlas] = None, tile_px: int = 8) -> str:
     """Чистая карта уровня без подписей (по умолчанию — обзорная, тайл 4 px)."""
     canvas, _ = draw_map(floor, atlas, floor_number, tile_px)
     if scale != 1:
@@ -333,8 +333,8 @@ def _legend_sprite(atlas: Atlas, spec: str) -> Image.Image:
 
 
 def render_annotated(floor: Floor, path: str, scale: int = 1, floor_number: int = 1,
-                     atlas: Optional[Atlas] = None, tile_px: int = 4) -> str:
-    """Карта + подписи комнат + легенда со спрайтами (обзорная, тайл 4 px)."""
+                     atlas: Optional[Atlas] = None, tile_px: int = 8) -> str:
+    """Карта + подписи комнат + легенда со спрайтами (обзорная, тайл 8 px)."""
     atlas = atlas or Atlas()
     canvas, tm = draw_map(floor, atlas, floor_number, tile_px)
     big = canvas if scale == 1 else canvas.resize(
