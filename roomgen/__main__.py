@@ -1,7 +1,9 @@
 """CLI: `python -m roomgen <команда>`.
 
   show   [--seed N]                 — один этаж в терминале (ASCII)
-  render [--seed N] [--out DIR]     — PNG: карта этажа, лист сидов, статистика
+  render [--seed N] [--out DIR]     — PNG: схема этажа, лист сидов, статистика
+  pixels [--seed N] [--floor N]     — PNG: этаж реальными спрайтами проекта
+  export [--seed N] [--out FILE]    — JSON с сеткой тайлов для сцены Godot
   check  [--count N]                — прогнать N сидов через проверки шага 8
 """
 
@@ -35,6 +37,38 @@ def cmd_render(args) -> int:
     print(figure_sheet(range(args.seed + 1, args.seed + 9),
                        os.path.join(args.out, "sheet.png")))
     print(figure_stats(args.count, os.path.join(args.out, "stats.png")))
+    return 0
+
+
+def cmd_pixels(args) -> int:
+    from .render_sprites import render_annotated, render_floor, render_room
+
+    os.makedirs(args.out, exist_ok=True)
+    floor = generate(args.seed)
+    print(render_floor(floor, os.path.join(args.out, "pixels_floor.png"),
+                       scale=args.scale, floor_number=args.floor))
+    print(render_annotated(floor, os.path.join(args.out, "pixels_annotated.png"),
+                           scale=args.scale, floor_number=args.floor))
+    for cell in sorted(floor.rooms()):
+        if floor.type_at(cell) is RoomType[args.room.upper()]:
+            print(render_room(floor, cell, os.path.join(args.out, "pixels_room.png"),
+                              floor_number=args.floor))
+            break
+    return 0
+
+
+def cmd_export(args) -> int:
+    import json
+
+    from .tilemap import to_dict
+
+    floor = generate(args.seed)
+    data = to_dict(floor)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    print(f"{args.out}: {len(data['rooms'])} комнат, "
+          f"сетка {data['tiles']['width']}×{data['tiles']['height']} тайлов")
     return 0
 
 
@@ -80,6 +114,21 @@ def main(argv=None) -> int:
     p_render.add_argument("--count", type=int, default=1500,
                           help="сколько этажей взять для графиков статистики")
     p_render.set_defaults(func=cmd_render)
+
+    p_pixels = sub.add_parser("pixels", help="рендер реальными спрайтами")
+    p_pixels.add_argument("--seed", type=int, default=12)
+    p_pixels.add_argument("--out", default="out")
+    p_pixels.add_argument("--scale", type=int, default=2)
+    p_pixels.add_argument("--floor", type=int, default=1,
+                          help="номер этажа: от него зависит число врагов")
+    p_pixels.add_argument("--room", default="cafeteria",
+                          help="тип комнаты для крупного плана")
+    p_pixels.set_defaults(func=cmd_pixels)
+
+    p_export = sub.add_parser("export", help="JSON для сцены Godot")
+    p_export.add_argument("--seed", type=int, default=12)
+    p_export.add_argument("--out", default="out/floor.json")
+    p_export.set_defaults(func=cmd_export)
 
     p_check = sub.add_parser("check", help="прогон проверок шага 8")
     p_check.add_argument("--count", type=int, default=2000)

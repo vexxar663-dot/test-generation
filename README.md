@@ -5,21 +5,28 @@ Python-версия нужна, чтобы проверить алгоритм �
 код под Godot: здесь за секунду прогоняются тысячи этажей и видно, что
 получается.
 
-📄 **[Полное описание алгоритма и замеров → docs/room_generation.md](docs/room_generation.md)**
+📄 **[Алгоритм и замеры → docs/room_generation.md](docs/room_generation.md)**
+🎨 **[Этаж на реальных спрайтах → docs/sprites.md](docs/sprites.md)**
 
-![Карта этажа](docs/images/floor.png)
+![Этаж на спрайтах](docs/images/pixels_floor.png)
+
+Тот же этаж схемой — так удобнее читать структуру:
+
+![Схема этажа](docs/images/floor.png)
 
 ## Запуск
 
 ```bash
 python3 -m roomgen show --seed 12     # этаж в терминале, без зависимостей
 python3 -m roomgen check --count 2000 # прогон проверок шага 8 на 2000 сидах
-python3 -m roomgen render --out out   # PNG: карта, лист сидов, статистика
-python3 -m unittest discover -s tests # 14 тестов
+python3 -m roomgen render --out out   # PNG: схема, лист сидов, статистика
+python3 -m roomgen pixels --seed 12   # PNG: этаж реальными спрайтами проекта
+python3 -m roomgen export --seed 12   # JSON с сеткой тайлов для сцены Godot
+python3 -m unittest discover -s tests # 23 теста
 ```
 
-Генератор и проверки работают на голом stdlib. matplotlib нужен только для
-`render` (`pip install -r requirements.txt`).
+Генератор, тайловая сетка и проверки работают на голом stdlib. matplotlib нужен
+для `render`, Pillow — для `pixels` (`pip install -r requirements.txt`).
 
 ## Что внутри
 
@@ -29,8 +36,12 @@ python3 -m unittest discover -s tests # 14 тестов
 | `roomgen/generator.py` | шаги 1–7: якоря, основной путь, тупики, заполнение, развилки |
 | `roomgen/validation.py` | шаг 8: связность, лимиты, «лестница только за боссом» |
 | `roomgen/ascii_render.py` | этаж в терминале |
-| `roomgen/viz.py` | карта, лист сидов и графики статистики на matplotlib |
-| `tests/` | инварианты, детерминированность, распределения |
+| `roomgen/viz.py` | схема, лист сидов и графики статистики на matplotlib |
+| `roomgen/tilemap.py` | комнаты → сетка тайлов (пол, стены, проёмы) + экспорт в JSON |
+| `roomgen/sprites.py` | атлас реальных спрайтов из `spites/` |
+| `roomgen/render_sprites.py` | рендер этажа пиксель-артом |
+| `spites/` | спрайты проекта, как в Godot (`res://spites/`) |
+| `tests/` | инварианты, детерминированность, распределения, тайловая сетка |
 
 ## Результат на 1500 сидах
 

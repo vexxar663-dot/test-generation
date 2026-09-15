@@ -1,3 +1,5 @@
-# Нужен только для `python -m roomgen render`.
-# Сам генератор и тесты работают на stdlib.
+# matplotlib — для `python -m roomgen render` (схема и графики).
+# Pillow — для `python -m roomgen pixels` (рендер реальными спрайтами).
+# Сам генератор, тайловая сетка и тесты работают на stdlib.
 matplotlib>=3.8
+pillow>=10.0
